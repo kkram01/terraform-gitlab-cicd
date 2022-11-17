@@ -1,0 +1,105 @@
+# Workflow image
+image:
+  name: hashicorp/terraform:0.13.2
+  entrypoint:
+    - "/usr/bin/env"
+    - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Workflow variables. They can be overwritten by passing pipeline Variables in Gitlab repository
+variables:     
+  TF_ROOT: $CI_PROJECT_DIR/image-creation
+  TF_LOG: WARN
+  TF_TIMEOUT: "-lock-timeout=600s"
+  TF_PLAN_NAME: plan.tfplan
+  TF_PLAN_JSON: plan.json
+  REFRESH: -refresh=true
+  ENVIRONMENT_NAME: "prod" 
+
+# Provides the Terraform version and reconfigures the backend state during init
+# Note: The leading dot (.) ignores this as a "job" while the ampersand (&) is an Anchor declaring the script as a variable to use elsewhere
+.terraform-ver-init: &terraform-ver-init
+  - cd $TF_ROOT
+  - terraform version
+  - terraform init --upgrade=True
+
+#terraform init is run before any stage jobs
+before_script:
+  - *terraform-ver-init
+
+# Cache files between jobs
+cache:
+  key: "$CI_COMMIT_SHA"
+  # Globally caches the .terraform folder across each job in this workflow
+  paths:
+    - $TF_ROOT/.terraform
+
+# Provides a list of stages for this GitLab workflow
+stages:
+  - validate
+  - plan
+  - apply
+
+#Job: tf-fmt | Stage: validate
+#Purpose: check the format (fmt) as a sort of linting test
+tf-fmt:
+  stage: validate
+  script:
+    - terraform fmt -recursive -check
+  only:
+    changes:
+      - "*.tf"
+      - "**/*.tf"
+    
+# Job: Validate | Stage: Validate
+# Purpose: Syntax Validation for the Terraform configuration files
+validate:
+  stage: validate
+  script:
+    - terraform validate
+  only:
+    changes:
+      - "*.tf"
+      - "**/*.tf"
+      - "**/*.tfvars"
+
+#Job: plan | Stage: Plan
+#Runs terraform plan and outputs the plan and a json summary to 
+#local files which are later made available as artifacts.
+plan: 
+  stage: plan
+  dependencies:
+    - validate
+  before_script:
+    - *terraform-ver-init
+    - apk --no-cache add jq
+    - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+  script:
+    - cd $TF_ROOT
+    - terraform plan -out=$TF_PLAN_NAME $REFRESH
+    - terraform show --json $TF_PLAN_NAME | convert_report > $TF_PLAN_JSON
+
+  only:
+    changes:
+      - "*.tf"
+      - "**/*.tf"
+      - "**/*.tfvars"
+
+  artifacts:
+    reports:
+      terraform: ${TF_ROOT}/$TF_PLAN_JSON
+    paths:
+      - ${TF_ROOT}/$TF_PLAN_NAME
+      - ${TF_ROOT}/$TF_PLAN_JSON
+    expire_in: 7 days   #optional. Gitlab stores artifacts of successful pipelines for the most recent commit on each ref. If needed, enable "Keep artifacts from most recent successful jobs"  in CI/CD settings of the repository.
+
+#Stage:apply | job: apply
+# purpose: executes the plan from the file created in the plan stage
+apply:
+  stage: apply
+  dependencies:
+    - plan
+  script:
+    - cd $TF_ROOT
+    - terraform apply -auto-approve $TF_PLAN_NAME 
+  only:
+    - main
